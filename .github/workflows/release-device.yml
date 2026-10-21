@@ -28,7 +28,8 @@ jobs:
     with:
       device: ${{ inputs.device }}
       esphome_version: ${{ inputs.esphome_version }}
-    secrets: inherit
+    secrets:
+      ESPHOME_SECRETS: ${{ secrets.ESPHOME_SECRETS }}
 
   publish:
     name: Publish device
