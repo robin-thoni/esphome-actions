@@ -38,7 +38,7 @@ jobs:
       - name: Download release files
         uses: actions/download-artifact@v4
         with:
-          name: device-release
+          name: device-release-${{ needs.build.outputs.device }}
           path: release
 
       - name: Upload release files and checksums

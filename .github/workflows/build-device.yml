@@ -163,6 +163,6 @@ jobs:
       - name: Upload release files
         uses: actions/upload-artifact@v4
         with:
-          name: device-release
+          name: device-release-${{ inputs.device }}
           path: release/
           if-no-files-found: error
