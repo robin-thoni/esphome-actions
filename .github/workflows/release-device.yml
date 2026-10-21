@@ -1,0 +1,111 @@
+name: Release device
+
+on:
+  workflow_call:
+    inputs:
+      device:
+        description: Device name whose firmware should be built and released
+        required: true
+        type: string
+      esphome_version:
+        description: Optional ESPHome version to use for the build
+        required: false
+        type: string
+    secrets:
+      ESPHOME_SECRETS:
+        required: true
+      UPLOAD_BASE_URL:
+        required: true
+      UPLOAD_USERNAME:
+        required: true
+      UPLOAD_PASSWORD:
+        required: true
+
+jobs:
+  build:
+    name: Build device
+    uses: robin-thoni/esphome-actions/.github/workflows/build-device.yml@main
+    with:
+      device: ${{ inputs.device }}
+      esphome_version: ${{ inputs.esphome_version }}
+    secrets: inherit
+
+  publish:
+    name: Publish device
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@v4
+        with:
+          name: device-release
+          path: release
+
+      - name: Upload release files and checksums
+        shell: bash
+        env:
+          UPLOAD_BASE_URL: ${{ secrets.UPLOAD_BASE_URL }}
+          UPLOAD_USERNAME: ${{ secrets.UPLOAD_USERNAME }}
+          UPLOAD_PASSWORD: ${{ secrets.UPLOAD_PASSWORD }}
+          DEVICE: ${{ needs.build.outputs.device }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$UPLOAD_BASE_URL" ||
+                -z "$UPLOAD_USERNAME" ||
+                -z "$UPLOAD_PASSWORD" ]]; then
+            echo "::error::Upload base URL or credentials are not configured"
+            exit 1
+          fi
+
+          device_url="${UPLOAD_BASE_URL%/}/${DEVICE}"
+          base_url="${device_url}/${VERSION}"
+          latest_url="${device_url}/latest"
+          manifest_url="${device_url}/manifest.json"
+
+          upload() {
+            local local_file="$1"
+            local remote_file="$2"
+
+            echo "Uploading $local_file to $remote_file"
+            curl \
+              --fail-with-body \
+              --silent \
+              --show-error \
+              --retry 3 \
+              --retry-all-errors \
+              --user "$UPLOAD_USERNAME:$UPLOAD_PASSWORD" \
+              --upload-file "$local_file" \
+              "$remote_file"
+          }
+
+          (
+            cd release
+
+            release_files=(*)
+            : > checksums.md5
+            : > checksums.sha1
+            : > checksums.sha256
+
+            for file in "${release_files[@]}"; do
+              md5sum "$file" > "${file}.md5"
+              md5sum "$file" >> checksums.md5
+              sha1sum "$file" > "${file}.sha1"
+              sha1sum "$file" >> checksums.sha1
+              sha256sum "$file" > "${file}.sha256"
+              sha256sum "$file" >> checksums.sha256
+            done
+          )
+
+          for file in release/*; do
+            filename=$(basename "$file")
+
+            upload "$file" "${base_url}/${filename}"
+            upload "$file" "${latest_url}/${filename}"
+          done
+
+          upload "release/manifest.json" "$manifest_url"
+
+          echo "Published ${DEVICE} ${VERSION} and latest"
+          echo "Manifest: $manifest_url"

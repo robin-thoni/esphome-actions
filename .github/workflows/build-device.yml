@@ -1,0 +1,168 @@
+name: Build device
+
+on:
+  workflow_call:
+    inputs:
+      device:
+        description: Device name whose ESPHome YAML configuration should be built
+        required: true
+        type: string
+      esphome_version:
+        description: ESPHome version to use for the build (defaults to 2026.9.0)
+        required: false
+        type: string
+    outputs:
+      device:
+        description: Device name built by the workflow
+        value: ${{ jobs.build.outputs.device }}
+      version:
+        description: Device version from the generated build manifest
+        value: ${{ jobs.build.outputs.version }}
+    secrets:
+      ESPHOME_SECRETS:
+        required: true
+
+jobs:
+  build:
+    name: Build device
+    runs-on: ubuntu-latest
+    outputs:
+      device: ${{ steps.device.outputs.device }}
+      version: ${{ steps.prepare.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Write ESPHome secrets
+        env:
+          ESPHOME_SECRETS: ${{ secrets.ESPHOME_SECRETS }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ESPHOME_SECRETS" > secrets.yaml
+
+      - name: Resolve device configuration
+        id: device
+        shell: bash
+        env:
+          DEVICE: ${{ inputs.device }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$DEVICE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::Invalid device name: $DEVICE"
+            echo "Device names may contain only letters, numbers, underscores, and hyphens."
+            exit 1
+          fi
+
+          yaml_file="${DEVICE}.yaml"
+
+          if [[ ! -f "$yaml_file" ]]; then
+            echo "::error::Configuration not found: $yaml_file"
+            exit 1
+          fi
+
+          echo "device=$DEVICE" >> "$GITHUB_OUTPUT"
+          echo "yaml_file=$yaml_file" >> "$GITHUB_OUTPUT"
+
+          echo "Building $DEVICE"
+
+      - name: Build ESPHome firmware
+        id: build
+        uses: esphome/build-action@v8.1.0
+        with:
+          yaml-file: ${{ steps.device.outputs.yaml_file }}
+          version: ${{ inputs.esphome_version || '2026.9.0' }}
+          complete-manifest: true
+
+      - name: Prepare firmware and release manifest
+        id: prepare
+        shell: bash
+        env:
+          DEVICE: ${{ steps.device.outputs.device }}
+          BUILD_NAME: ${{ steps.build.outputs.name }}
+        run: |
+          set -euo pipefail
+
+          build_dir="$BUILD_NAME"
+
+          ota_source="$build_dir/$BUILD_NAME.ota.bin"
+          factory_source="$build_dir/$BUILD_NAME.factory.bin"
+          manifest_source="$build_dir/manifest.json"
+
+          if [[ ! -f "$ota_source" ]]; then
+            echo "::error::OTA firmware not found: $ota_source"
+            exit 1
+          fi
+
+          if [[ ! -f "$manifest_source" ]]; then
+            echo "::error::Build manifest not found: $manifest_source"
+            exit 1
+          fi
+
+          if ! jq -e '.version | type == "string" and length > 0' "$manifest_source" > /dev/null; then
+            echo "::error::Build manifest does not contain a valid device version"
+            exit 1
+          fi
+
+          VERSION=$(jq -r '.version' "$manifest_source")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          mkdir -p release
+
+          cp "$ota_source" release/firmware.ota.bin
+
+          if [[ -f "$factory_source" ]]; then
+            cp "$factory_source" release/firmware.factory.bin
+          fi
+
+          md5=$(md5sum release/firmware.ota.bin | cut -d ' ' -f 1)
+
+          jq \
+            --arg name "$DEVICE" \
+            --arg version "$VERSION" \
+            --arg md5 "$md5" \
+            --arg ota_path "${VERSION}/firmware.ota.bin" \
+            --arg factory_path "${VERSION}/firmware.factory.bin" \
+            '
+            .name = $name
+            | .version = $version
+            | .builds |= map(
+                .ota.md5 = $md5
+                | .ota.path = $ota_path
+                | .parts |= map(
+                    if .path | endswith(".factory.bin") then
+                      .path = $factory_path
+                    else
+                      .
+                    end
+                  )
+            )
+            ' \
+            "$manifest_source" > release/manifest.json
+
+          jq -e '
+            (.name | type == "string")
+            and (.version | type == "string")
+            and (.builds | type == "array" and length > 0)
+            and all(.builds[];
+              (.chipFamily | type == "string")
+              and (.ota.md5 | type == "string")
+              and (.ota.path | type == "string")
+            )
+          ' release/manifest.json > /dev/null
+
+          echo "Release files:"
+          ls -lh release/
+
+          echo "Manifest:"
+          jq . release/manifest.json
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-release
+          path: release/
+          if-no-files-found: error
